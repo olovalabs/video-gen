@@ -104,6 +104,135 @@ def probe_dimensions(path: str):
     return stream["width"], stream["height"]
 
 
+def probe_duration(path: str) -> float:
+    """Get duration in seconds using ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def has_audio_stream(path: str) -> bool:
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0",
+           "-show_entries", "stream=codec_name", "-of", "csv=p=0", path]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return bool(r.stdout.strip())
+
+
+# --- Background music removal for Video 1 ---
+
+def _demucs_available() -> bool:
+    import importlib.util
+    return importlib.util.find_spec("demucs") is not None or shutil.which("demucs") is not None
+
+
+def _run_demucs_vocals(in_path: str, out_wav: str, model: str = "htdemucs") -> bool:
+    """
+    Try Facebook Demucs to extract vocals (voice) and drop bg music.
+    Uses htdemucs_ft (fine-tuned, best) with fallback to htdemucs.
+    Returns True on success and writes out_wav (48k wav).
+    Falls back to False if demucs not installed or fails.
+    """
+    if not _demucs_available():
+        return False
+    # Try cached best model first (htdemucs already downloaded), then try better variants
+    for try_model in (model, "htdemucs_ft", "mdx_extra"):
+        try:
+            tmp_dir = os.path.join(WORKDIR, "_demucs_out")
+            if os.path.isdir(tmp_dir):
+                shutil.rmtree(tmp_dir)
+            os.makedirs(tmp_dir, exist_ok=True)
+            import sys
+            py_exe = sys.executable  # robust on Windows (py launcher)
+            cmd = [
+                py_exe, "-m", "demucs",
+                "--two-stems=vocals", "-n", try_model,
+                "-d", "cpu",
+                "-o", tmp_dir, in_path,
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
+            except Exception:
+                cmd2 = ["demucs", "--two-stems=vocals", "-n", try_model, "-d", "cpu", "-o", tmp_dir, in_path]
+                subprocess.run(cmd2, check=True, capture_output=True, text=True, timeout=600)
+
+            found = glob.glob(os.path.join(tmp_dir, "**", "vocals.wav"), recursive=True)
+            if not found:
+                print(f"[music-remover] model {try_model} produced no vocals.wav, trying next")
+                continue
+            cand = found[0]
+            # convert to 48k stereo wav for muxing
+            subprocess.run([
+                "ffmpeg", "-y", "-i", cand,
+                "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", out_wav
+            ], check=True, capture_output=True)
+            if os.path.isfile(out_wav):
+                print(f"[music-remover] Demucs {try_model} success -> {out_wav}")
+                return True
+        except Exception as e:
+            print(f"[music-remover] Demucs {try_model} failed: {e}")
+            continue
+    return False
+
+
+def _prepare_video1_without_bgm(video1: str, workdir: str = WORKDIR) -> str:
+    """
+    Create a copy of video1 where bg music is removed (vocals kept).
+    Tries Demucs (AI) first; falls back to lightweight FFmpeg vocal isolation.
+    Returns path to new video file (or original if no audio / failed).
+    Caller must use the returned path as input 0 for merging.
+    """
+    if not has_audio_stream(video1):
+        return video1
+
+    # Try AI separation -> produce clean vocals wav, then mux
+    vocals_wav = os.path.join(workdir, "_v1_vocals.wav")
+    if _run_demucs_vocals(video1, vocals_wav):
+        out_path = os.path.join(workdir, "_v1_nobgm.mp4")
+        # mux original video + cleaned vocals (ignore original audio)
+        try:
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", video1,
+                "-i", vocals_wav,
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "128k",
+                "-shortest",
+                out_path
+            ], check=True, capture_output=True, text=True)
+            if os.path.isfile(out_path):
+                print(f"[music-remover] Demucs vocals isolated -> {out_path}")
+                return out_path
+        except subprocess.CalledProcessError as e:
+            print(f"[music-remover] mux failed: {e.stderr[-400:]}")
+
+    # Fallback will be handled inline via ffmpeg filter (no pre-processing needed).
+    # We return original and signal caller to apply FFmpeg filter.
+    # To indicate fallback needed, we return original path - caller checks _demucs_available() result
+    # via a sentinel file. Simpler: return original, and merge_videos will apply filter branch.
+    return video1
+
+
+# For fallback, this audio filter keeps voice band and suppresses music
+# Center vocal + bandpass 120-3000Hz + noise suppress + compress -> stereo
+FF_FALLBACK_VOCAL_FILTER = (
+    "aformat=channel_layouts=mono,"
+    "highpass=f=120:width_type=o:width=1,"
+    "lowpass=f=3000:width_type=o:width=1,"
+    "afftdn=nf=-20:tn=1:nr=12,"
+    "acompressor=threshold=-20dB:ratio=6:attack=20:release=250,"
+    "aresample=48000,"
+    "pan=stereo|c0=c0|c1=c0"
+)
+
+
 def generate_feather_mask(width: int, height: int, feather_min=45, feather_max=85,
                            seed=None) -> tuple[str, int]:
     """
@@ -128,6 +257,55 @@ def generate_feather_mask(width: int, height: int, feather_min=45, feather_max=8
     return mask_path, feather
 
 
+def _insert_ad(
+    base_path: str,
+    ad_path: str,
+    insert_sec: float,
+    out_path: str,
+    W: int,
+    H: int,
+    fps: int = 30,
+) -> str:
+    """
+    Insert ad_path at insert_sec into base_path (which is already rendered).
+    Produces: [0:00 -> insert_sec] + [ad full] + [insert_sec -> end]
+    Ad is scaled/padded to W x H and its audio is kept.
+    """
+    total_dur = probe_duration(base_path)
+    if total_dur <= insert_sec + 0.5:
+        # Too short to insert - just copy base to out_path
+        shutil.copy2(base_path, out_path)
+        return out_path
+
+    # Clamp insert point
+    insert_sec = max(1.0, min(insert_sec, total_dur - 1.0))
+
+    # All audio segments are normalized to same format so concat works
+    filter_complex = (
+        f"[0:v]trim=start=0:end={insert_sec},setpts=PTS-STARTPTS[pre_v];"
+        f"[0:a]atrim=start=0:end={insert_sec},asetpts=PTS-STARTPTS,aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[pre_a];"
+        f"[0:v]trim=start={insert_sec},setpts=PTS-STARTPTS[post_v];"
+        f"[0:a]atrim=start={insert_sec},asetpts=PTS-STARTPTS,aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[post_a];"
+        f"[1:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
+        f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps},format=yuv420p[ad_v0];"
+        f"[ad_v0]fps={fps}[ad_v];"
+        f"[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[ad_a];"
+        f"[pre_v][pre_a][ad_v][ad_a][post_v][post_a]concat=n=3:v=1:a=1[vout][aout]"
+    )
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", base_path,
+        "-i", ad_path,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-c:a", "aac", "-b:a", "128k",
+        out_path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    return out_path
+
+
 def merge_videos(
     video1: str,
     video2: str,
@@ -138,6 +316,11 @@ def merge_videos(
     seed: int = None,
     out_name: str = "output.mp4",
     template: str = None,
+    ad_path: str = None,
+    ad_insert_sec: float = 15.0,
+    ad_random: bool = False,
+    remove_bgm: bool = False,
+    mute_video1: bool = False,
 ) -> tuple[str, int]:
     """
     video1 -> left side, full length kept, its audio is the output audio.
@@ -148,7 +331,38 @@ def merge_videos(
     alphamerge+overlay so the gradient mask blends every plane cleanly.
     If `template` (frame image with banners) is given, it is overlaid on top
     with the video window made transparent.
+
+    Ad insertion:
+        if ad_path is provided and exists, the merged video is cut at
+        ad_insert_sec (or random point >= ad_insert_sec if ad_random=True)
+        and the ad is inserted fullscreen (scaled to W x H) with its own audio.
+        Flow: [merged 0 -> insert] + [ad full] + [merged insert -> end]
+
+    BGM removal:
+        if remove_bgm=True, Video 1 audio is processed to remove background music
+        and keep voice. Tries AI Demucs (htdemucs_ft -> htdemucs) first; if not
+        installed falls back to an FFmpeg vocal band + denoise filter.
+        Install AI: pip install demucs torch --index-url https://download.pytorch.org/whl/cpu
+        If mute_video1=True, Video 1 audio is totally muted (volume=0) -> 100% music removal.
     """
+    # --- Optional: audio handling for Video 1 ---
+    original_v1 = video1
+    use_ff_fallback = False
+    # 1) Total mute has priority (100% removal)
+    if mute_video1:
+        # will be handled via audio filter volume=0 later, no pre-processing needed
+        print("[merge] Video1 will be TOTALLY MUTED (volume=0) -> 100% music removal")
+    elif remove_bgm:
+        cleaned = _prepare_video1_without_bgm(video1)
+        if cleaned != video1 and os.path.isfile(cleaned):
+            print(f"[merge] Using AI-cleaned Video1: {cleaned}")
+            video1 = cleaned
+        else:
+            # Demucs not available -> will use FFmpeg vocal filter inline
+            if has_audio_stream(video1):
+                use_ff_fallback = True
+                print("[merge] Demucs not available, using FFmpeg vocal fallback filter")
+
     w1, h1 = probe_dimensions(video1)
     W, H = w1, h1
 
@@ -159,13 +373,22 @@ def merge_videos(
     fps = 30
     half = (W + feather) // 2
     x1 = W - half
+    # Audio chain for Video 1: mute > vocal-isolation > plain
+    if mute_video1:
+        # total mute: volume 0 then atempo, still keeps sync but silence
+        audio_filter = f"[0:a]volume=0,atempo={speed1}[aout]"
+    elif use_ff_fallback:
+        audio_filter = f"[0:a]{FF_FALLBACK_VOCAL_FILTER},atempo={speed1}[aout]"
+    else:
+        audio_filter = f"[0:a]atempo={speed1}[aout]"
+
     filter_complex = (
         f"[0:v]setpts=PTS/{speed1},scale={half}:{H},setsar=1,fps={fps},pad={W}:{H}:0:0[v0];"
         f"[1:v]setpts=PTS/{speed2},scale={half}:{H},setsar=1,fps={fps},pad={W}:{H}:{x1}:0[v1];"
         f"[2:v]scale={W}:{H},format=gray[msk];"
         f"[v1][msk]alphamerge[ovl];"
         f"[v0][ovl]overlay=format=auto[vout];"
-        f"[0:a]atempo={speed1}[aout]"
+        f"{audio_filter}"
     )
 
     inputs = [
@@ -180,6 +403,8 @@ def merge_videos(
     else:
         map_out = "[vout]"
 
+    # Render to a temp file first so we can optionally insert an ad
+    tmp_out = out_path if not ad_path else os.path.join(WORKDIR, "_merged_tmp.mp4")
     cmd = [
         "ffmpeg", "-y",
         *inputs,
@@ -188,7 +413,35 @@ def merge_videos(
         "-shortest",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-c:a", "aac",
-        out_path,
+        tmp_out,
     ]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+    # --- Ad insertion ---
+    if ad_path and os.path.isfile(ad_path):
+        insert_sec = float(ad_insert_sec) if ad_insert_sec else 15.0
+        if ad_random:
+            dur = probe_duration(tmp_out)
+            # random between insert_sec and dur-2s (keep at least 2s tail)
+            max_start = max(insert_sec, dur - 2.0)
+            if max_start > insert_sec:
+                rng = random.Random(seed if seed not in (None, 0) else None)
+                insert_sec = rng.uniform(insert_sec, max_start)
+        try:
+            _insert_ad(tmp_out, ad_path, insert_sec, out_path, W, H, fps=fps)
+            # cleanup temp
+            if tmp_out != out_path and os.path.isfile(tmp_out):
+                try:
+                    os.remove(tmp_out)
+                except OSError:
+                    pass
+        except subprocess.CalledProcessError as e:
+            # Fallback: return base video if ad insertion fails
+            print(f"Ad insertion failed, returning base video: {e.stderr[-500:]}")
+            if tmp_out != out_path:
+                shutil.copy2(tmp_out, out_path)
+    else:
+        if tmp_out != out_path:
+            shutil.move(tmp_out, out_path)
+
     return out_path, feather

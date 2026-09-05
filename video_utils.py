@@ -15,11 +15,42 @@ import random
 import shutil
 import subprocess
 import json
+import re
 import numpy as np
 from PIL import Image
 
+# Force UTF-8 encoding across Python and subprocesses to avoid Windows cp1252 charmap decode errors
+os.environ["PYTHONIOENCODING"] = "utf-8"
+os.environ["PYTHONUTF8"] = "1"
+
 WORKDIR = "workdir"
 os.makedirs(WORKDIR, exist_ok=True)
+
+
+def run_cmd(cmd, **kwargs):
+    """
+    Run a subprocess command safely with UTF-8 encoding and errors='replace'.
+    Prevents Windows charmap / cp1252 decoding crashes on non-ASCII characters or binary streams.
+    """
+    kwargs.setdefault("capture_output", True)
+    kwargs.setdefault("text", True)
+    kwargs.setdefault("encoding", "utf-8")
+    kwargs.setdefault("errors", "replace")
+    return subprocess.run(cmd, **kwargs)
+
+
+def sanitize_filename(name: str, max_length: int = 120) -> str:
+    """Sanitize string to be a safe Windows/Unix filename."""
+    if not name:
+        return "video"
+    # Remove characters illegal in Windows/Unix filenames
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip('. ')
+    if not cleaned:
+        cleaned = "video"
+    if len(cleaned) > max_length:
+        cleaned = cleaned[:max_length].rstrip('. ')
+    return cleaned
 
 
 def _ensure_ffmpeg_on_path():
@@ -36,6 +67,42 @@ def _ensure_ffmpeg_on_path():
 
 
 _ensure_ffmpeg_on_path()
+
+
+def conform_to_720x1280(input_path: str, output_path: str, fps: int = 30) -> str:
+    """
+    Ensure video is exactly 720x1280 MP4 (vertical HD Shorts format).
+    If it's already 720x1280, it will be copied or re-encoded to MP4.
+    Otherwise, scales with aspect ratio preserved and padded to 720x1280.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    try:
+        w, h = probe_dimensions(input_path)
+        if w == 720 and h == 1280 and input_path.lower().endswith(".mp4"):
+            shutil.copy2(input_path, output_path)
+            return output_path
+    except Exception:
+        pass
+
+    filter_str = (
+        f"scale=720:1280:force_original_aspect_ratio=decrease,"
+        f"pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,"
+        f"setsar=1,fps={fps},format=yuv420p"
+    )
+    has_a = has_audio_stream(input_path)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-vf", filter_str,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+    ]
+    if has_a:
+        cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+    else:
+        cmd.extend(["-an"])
+    cmd.append(output_path)
+    run_cmd(cmd, check=True)
+    return output_path
 
 
 def prepare_template(width: int, height: int, src: str = "banner.png") -> str:
@@ -98,7 +165,7 @@ def probe_dimensions(path: str):
         "-show_entries", "stream=width,height",
         "-of", "json", path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    result = run_cmd(cmd, check=True)
     info = json.loads(result.stdout)
     stream = info["streams"][0]
     return stream["width"], stream["height"]
@@ -111,7 +178,7 @@ def probe_duration(path: str) -> float:
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1", path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    result = run_cmd(cmd, check=True)
     try:
         return float(result.stdout.strip())
     except ValueError:
@@ -121,7 +188,7 @@ def probe_duration(path: str) -> float:
 def has_audio_stream(path: str) -> bool:
     cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0",
            "-show_entries", "stream=codec_name", "-of", "csv=p=0", path]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = run_cmd(cmd)
     return bool(r.stdout.strip())
 
 
@@ -157,10 +224,10 @@ def _run_demucs_vocals(in_path: str, out_wav: str, model: str = "htdemucs") -> b
                 "-o", tmp_dir, in_path,
             ]
             try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
+                run_cmd(cmd, check=True, timeout=600)
             except Exception:
                 cmd2 = ["demucs", "--two-stems=vocals", "-n", try_model, "-d", "cpu", "-o", tmp_dir, in_path]
-                subprocess.run(cmd2, check=True, capture_output=True, text=True, timeout=600)
+                run_cmd(cmd2, check=True, timeout=600)
 
             found = glob.glob(os.path.join(tmp_dir, "**", "vocals.wav"), recursive=True)
             if not found:
@@ -168,10 +235,10 @@ def _run_demucs_vocals(in_path: str, out_wav: str, model: str = "htdemucs") -> b
                 continue
             cand = found[0]
             # convert to 48k stereo wav for muxing
-            subprocess.run([
+            run_cmd([
                 "ffmpeg", "-y", "-i", cand,
                 "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", out_wav
-            ], check=True, capture_output=True)
+            ], check=True)
             if os.path.isfile(out_wav):
                 print(f"[music-remover] Demucs {try_model} success -> {out_wav}")
                 return True
@@ -197,7 +264,7 @@ def _prepare_video1_without_bgm(video1: str, workdir: str = WORKDIR) -> str:
         out_path = os.path.join(workdir, "_v1_nobgm.mp4")
         # mux original video + cleaned vocals (ignore original audio)
         try:
-            subprocess.run([
+            run_cmd([
                 "ffmpeg", "-y",
                 "-i", video1,
                 "-i", vocals_wav,
@@ -206,7 +273,7 @@ def _prepare_video1_without_bgm(video1: str, workdir: str = WORKDIR) -> str:
                 "-c:a", "aac", "-b:a", "128k",
                 "-shortest",
                 out_path
-            ], check=True, capture_output=True, text=True)
+            ], check=True)
             if os.path.isfile(out_path):
                 print(f"[music-remover] Demucs vocals isolated -> {out_path}")
                 return out_path
@@ -302,7 +369,7 @@ def _insert_ad(
         "-c:a", "aac", "-b:a", "128k",
         out_path,
     ]
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    run_cmd(cmd, check=True)
     return out_path
 
 
@@ -368,7 +435,11 @@ def merge_videos(
 
     mask_path, feather = generate_feather_mask(W, H, feather_min, feather_max, seed)
     tpl_path = prepare_template(W, H, template) if template else None
-    out_path = os.path.join(WORKDIR, out_name)
+    if os.path.isabs(out_name) or os.path.dirname(out_name):
+        out_path = os.path.abspath(out_name)
+    else:
+        out_path = os.path.abspath(os.path.join(WORKDIR, out_name))
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     fps = 30
     half = (W + feather) // 2
@@ -415,7 +486,7 @@ def merge_videos(
         "-c:a", "aac",
         tmp_out,
     ]
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    run_cmd(cmd, check=True)
 
     # --- Ad insertion ---
     if ad_path and os.path.isfile(ad_path):
